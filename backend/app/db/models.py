@@ -39,7 +39,7 @@ class MarketDataCandle(Base):
     taker_buy_base_volume: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
     taker_buy_quote_volume: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
 
-    source: Mapped[str] = mapped_column(String(20), nullable=False)
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
@@ -76,7 +76,7 @@ class OrderIntentRecord(Base):
 
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     side: Mapped[str] = mapped_column(String(10), nullable=False)
-    order_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(20), nullable=False)  # e.g. STOP_LOSS_LIMIT is 15 chars
 
     quantity: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
     expected_price: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
@@ -105,7 +105,7 @@ class ExchangeOrderRecord(Base):
 
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     side: Mapped[str] = mapped_column(String(10), nullable=False)
-    order_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(20), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
 
     price: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
