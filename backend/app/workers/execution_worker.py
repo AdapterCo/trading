@@ -10,12 +10,13 @@ import asyncio
 from decimal import Decimal
 
 from app.alerts.service import AlertService
-from app.core.config import Settings, get_settings
+from app.core.config import Settings, TradingMode, get_settings
 from app.core.logging import configure_logging, get_logger
 from app.db.base import SessionLocal
 from app.exchange.base import ExchangeAdapter
 from app.exchange.binance_adapter import BinanceExchangeAdapter
-from app.execution.fills import extract_fills_from_order_info
+from app.execution.fills import FillRepository, fill_record_to_trade_fill
+from app.execution.paper_sender import PaperOrderSender
 from app.execution.repository import ExchangeOrderRepository
 from app.execution.sender import OrderSendError, OrderSender
 from app.features.engine import FeatureEngine
@@ -44,6 +45,13 @@ class ExecutionWorker:
         self._risk_engine = RiskEngine(settings)
         self._feature_engine = FeatureEngine()
         self._last_reconciliation_ok = False
+
+    def _make_sender(self, order_repo: ExchangeOrderRepository, fill_repo: FillRepository):
+        """instrucao.md #5 — only LIVE ever reaches the real exchange's order endpoint.
+        Every other mode simulates against real, read-only market data instead."""
+        if self._settings.trading_mode is TradingMode.LIVE:
+            return OrderSender(self._exchange, order_repo, fill_repo)
+        return PaperOrderSender(self._exchange, order_repo, fill_repo, quote_asset=self._settings.quote_asset)
 
     def startup(self) -> None:
         """instrucao.md #55, #58 — block trading until reconciled."""
@@ -155,8 +163,9 @@ class ExecutionWorker:
         s = self._settings
         intent_repo = OrderIntentRepository(session)
         order_repo = ExchangeOrderRepository(session)
+        fill_repo = FillRepository(session)
         ledger = LedgerService(session, quote_asset=s.quote_asset)
-        sender = OrderSender(self._exchange, order_repo)
+        sender = self._make_sender(order_repo, fill_repo)
 
         from app.risk.types import RiskDecision
         from app.strategy.types import Signal
@@ -185,8 +194,7 @@ class ExecutionWorker:
             self._alerts.send("ORDER_ERROR", "exit order send failed after retry", context={"symbol": s.symbol})
             return
 
-        info = self._exchange.get_order(s.symbol, client_order_id=intent.client_order_id)
-        fills = extract_fills_from_order_info(info)
+        fills = [fill_record_to_trade_fill(f) for f in fill_repo.get_for_order(order_row.exchange_order_id)]
         for fill in fills:
             ledger.record_fill(symbol=s.symbol, side="SELL", fill=fill, position_id=position.id)
 
@@ -257,7 +265,8 @@ class ExecutionWorker:
         intent = OrderIntentRepository(session).create_from_decision(
             signal=signal, decision=decision, settings=s, side="BUY", order_type="MARKET"
         )
-        sender = OrderSender(self._exchange, ExchangeOrderRepository(session))
+        fill_repo = FillRepository(session)
+        sender = self._make_sender(ExchangeOrderRepository(session), fill_repo)
         try:
             order_row = sender.send(intent)
         except OrderSendError:
@@ -266,8 +275,7 @@ class ExecutionWorker:
             self._alerts.send("ORDER_ERROR", "entry order send failed after retry", context={"symbol": s.symbol})
             return
 
-        info = self._exchange.get_order(s.symbol, client_order_id=intent.client_order_id)
-        fills = extract_fills_from_order_info(info)
+        fills = [fill_record_to_trade_fill(f) for f in fill_repo.get_for_order(order_row.exchange_order_id)]
         if not fills:
             logger.warning("entry_order_no_fills_yet", extra={"context": {"client_order_id": intent.client_order_id}})
             return

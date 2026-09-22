@@ -35,10 +35,14 @@ def _d(value: object) -> Decimal:
 
 class BinanceExchangeAdapter(ExchangeAdapter):
     def __init__(self, settings: Settings) -> None:
+        # Only TESTNET mode talks to Binance's testnet — it has its own separate key
+        # database, so mainnet credentials would fail there with -2015. PAPER/RESEARCH
+        # use PROD for read-only market/account data (real orders never reach this
+        # adapter in those modes — see PaperOrderSender, instrucao.md #5).
         base_path = (
-            SPOT_REST_API_PROD_URL
-            if settings.trading_mode is TradingMode.LIVE
-            else SPOT_REST_API_TESTNET_URL
+            SPOT_REST_API_TESTNET_URL
+            if settings.trading_mode is TradingMode.TESTNET
+            else SPOT_REST_API_PROD_URL
         )
         config = ConfigurationRestAPI(
             api_key=settings.binance_api_key,

@@ -88,3 +88,19 @@ def extract_fills_from_order_info(info: OrderInfo) -> list[TradeFill]:
         )
         for f in raw_fills
     ]
+
+
+def fill_record_to_trade_fill(row: FillRecord) -> TradeFill:
+    """Reconstructs a TradeFill from a persisted FillRecord — used so callers can
+    read back fills a sender already persisted instead of re-querying the exchange."""
+    return TradeFill(
+        exchange_trade_id=row.exchange_trade_id,
+        exchange_order_id=row.exchange_order_id,
+        symbol=row.symbol,
+        price=Decimal(row.price),
+        quantity=Decimal(row.quantity),
+        commission=Decimal(row.commission),
+        commission_asset=row.commission_asset,
+        is_buyer=row.is_buyer,
+        timestamp=row.timestamp,
+    )

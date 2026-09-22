@@ -11,7 +11,7 @@ from decimal import Decimal
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.core.config import Settings
+from app.core.config import Settings, TradingMode
 from app.db import models  # noqa: F401 — registers all tables
 from app.db.base import Base
 from app.db.models import BotStateRecord, LedgerEntryRecord, PositionRecord
@@ -20,6 +20,7 @@ from app.exchange.types import (
     AccountInfo,
     BestBidAsk,
     Candle,
+    CommissionRates,
     OrderInfo,
     SymbolRules,
 )
@@ -74,6 +75,9 @@ class FakeExchange:
     def get_best_bid_ask(self, symbol):
         return BestBidAsk(symbol="BTCUSDT", bid_price=self.ask_price, bid_qty=Decimal("1"), ask_price=self.ask_price, ask_qty=Decimal("1"))
 
+    def get_commissions(self, symbol):
+        return CommissionRates(symbol="BTCUSDT", maker=Decimal("0.001"), taker=Decimal("0.001"))
+
     def create_order(self, **kwargs):
         self.create_order_calls.append(kwargs)
         qty = kwargs["quantity"]
@@ -107,7 +111,9 @@ class FixedBuySignalStrategy:
 
 
 def _worker(exchange, settings=None) -> ExecutionWorker:
-    worker = ExecutionWorker(settings or Settings(_env_file=None), exchange=exchange)
+    # LIVE by default so these tests exercise the real OrderSender -> create_order
+    # path; paper-mode tests below explicitly pass TradingMode.PAPER instead.
+    worker = ExecutionWorker(settings or Settings(_env_file=None, trading_mode=TradingMode.LIVE), exchange=exchange)
     worker._strategy = FixedBuySignalStrategy()
     worker._last_reconciliation_ok = True
     return worker
@@ -218,3 +224,36 @@ def test_emergency_exit_closes_open_position_and_blocks_new_entries(monkeypatch)
     candle = _candle(300_600_000, "100")
     worker._run_cycle(session, candle)
     assert len(exchange.create_order_calls) == 1  # only the emergency SELL, no new BUY afterward
+
+
+def test_paper_mode_never_calls_real_create_order(monkeypatch):
+    """instrucao.md #5 — the exact bug that broke production: paper mode must never
+    reach the real exchange's order endpoint (it has no testnet credentials)."""
+    session = _session()
+    monkeypatch.setattr("app.workers.execution_worker.SessionLocal", lambda: session)
+
+    exchange = FakeExchange(usdt_balance=Decimal("1000"), ask_price=Decimal("100"))
+    paper_settings = Settings(_env_file=None, trading_mode=TradingMode.PAPER)
+    worker = _worker(exchange, settings=paper_settings)
+
+    candle = _candle(300_000_000, "100")
+    worker._run_cycle(session, candle)
+
+    assert exchange.create_order_calls == []  # real order endpoint never touched
+    positions = session.query(PositionRecord).all()
+    assert len(positions) == 1
+    assert positions[0].status == "OPEN"
+
+
+def test_paper_mode_fills_use_real_market_price_and_commission():
+    session = _session()
+    exchange = FakeExchange(usdt_balance=Decimal("1000"), ask_price=Decimal("123.45"))
+    paper_settings = Settings(_env_file=None, trading_mode=TradingMode.PAPER)
+    worker = _worker(exchange, settings=paper_settings)
+
+    candle = _candle(300_000_000, "100")
+    worker._run_cycle(session, candle)
+
+    position = session.query(PositionRecord).one()
+    assert Decimal(position.average_entry) == Decimal("123.45")  # real best-ask price, not the candle close
+    assert Decimal(position.fees_total) > 0  # real taker commission applied
