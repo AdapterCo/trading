@@ -297,6 +297,22 @@ def test_ensure_current_candle_included_noop_when_already_present_and_matching()
     assert result == history
 
 
+def test_ensure_current_candle_included_drops_still_forming_next_candle_from_rest():
+    """The actual bug that survived the first fix attempt: REST /klines can return
+    the NEXT, still-forming candle as its last entry (real VPS incident — REST's
+    last open_time was newer than the just-closed candle from the WebSocket)."""
+    from app.workers.execution_worker import _ensure_current_candle_included
+
+    current = _candle(600_000, "102")  # just closed, per the WebSocket
+    still_forming_next = _candle(900_000, "103")  # REST already shows the next, open candle
+    history = [_candle(0, "100"), _candle(300_000, "101"), current, still_forming_next]
+
+    result = _ensure_current_candle_included(history, current)
+
+    assert result[-1] is current
+    assert [c.open_time for c in result] == [0, 300_000, 600_000]
+
+
 def test_run_cycle_finds_signal_even_when_rest_history_lags_behind_websocket(monkeypatch):
     """End-to-end regression test for the real production incident: REST history
     missing the just-closed candle must no longer produce MISSING_5M_FEATURE_FOR_CANDLE."""
@@ -312,6 +328,29 @@ def test_run_cycle_finds_signal_even_when_rest_history_lags_behind_websocket(mon
     worker = _worker(exchange)
 
     candle = _candle(29 * 300_000, "100")
+    worker._run_cycle(session, candle)
+
+    signal = session.query(models.SignalRecord).order_by(models.SignalRecord.created_at.desc()).first()
+    assert "MISSING_5M_FEATURE_FOR_CANDLE" not in (signal.reasons or [])
+
+
+def test_run_cycle_finds_signal_even_when_rest_includes_still_forming_next_candle(monkeypatch):
+    """Exact end-to-end reproduction of the real VPS incident: REST /klines
+    returned the just-closed candle AND the next, still-forming one after it,
+    which the first (incomplete) fix attempt still missed."""
+    session = _session()
+    monkeypatch.setattr("app.workers.execution_worker.SessionLocal", lambda: session)
+
+    class AheadFakeExchange(FakeExchange):
+        def get_klines(self, symbol, interval, *, start_time=None, end_time=None, limit=1000):
+            closed = [_candle(i * 300_000, "100") for i in range(30)]  # includes index 29, the closing candle
+            still_forming = _candle(30 * 300_000, "100")  # the next candle, already visible but not closed
+            return [*closed, still_forming]
+
+    exchange = AheadFakeExchange(usdt_balance=Decimal("1000"), ask_price=Decimal("100"))
+    worker = _worker(exchange)
+
+    candle = _candle(29 * 300_000, "100")  # the WebSocket's just-closed candle
     worker._run_cycle(session, candle)
 
     signal = session.query(models.SignalRecord).order_by(models.SignalRecord.created_at.desc()).first()

@@ -361,16 +361,18 @@ def _vwap(fills):
 
 
 def _ensure_current_candle_included(candles: list, current):
-    """The exchange's REST /klines history can lag a few hundred ms behind a
-    just-closed candle the WebSocket already confirmed — without this, Strategy
-    sees a stale series missing the very candle that triggered this cycle and
-    HOLDs with MISSING_5M_FEATURE_FOR_CANDLE on every single close. `current`
-    (from the WS event) is always authoritative for its own open_time."""
-    if not candles or candles[-1].open_time < current.open_time:
-        return [*candles, current]
-    if candles[-1].open_time == current.open_time:
-        return [*candles[:-1], current]
-    return candles
+    """instrucao.md #11/#99 — the exchange's REST /klines history is unreliable
+    around a just-closed candle in BOTH directions: it can still lag behind (not
+    yet indexed the close) OR already include the NEXT, still-forming candle as
+    its last entry (real incident: REST returned open_time=22:15:00 forming
+    candle last, pushing the just-closed 22:10:00 one into second-to-last, so a
+    naive "fix the last element" check missed it entirely).
+
+    `current` (from the WebSocket close event) is always authoritative for its
+    own open_time — drop anything at or after it and append current instead of
+    trying to reconcile positions."""
+    trimmed = [c for c in candles if c.open_time < current.open_time]
+    return [*trimmed, current]
 
 
 async def main() -> None:
