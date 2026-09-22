@@ -220,18 +220,49 @@ class BinanceExchangeAdapter(ExchangeAdapter):
             )
         return fills
 
-    def create_order(self, **kwargs) -> OrderInfo:
-        raise NotImplementedError(
-            "create_order is implemented in Fase 8 (execução real com idempotência, instrucao.md #45-#47)"
+    def create_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        client_order_id: str,
+        price: Decimal | None = None,
+    ) -> OrderInfo:
+        """instrucao.md #45-#47. Sends Decimal straight through (never float) so the
+        exact quantity string reaches the exchange — the SDK stringifies floats via
+        str(), which can silently mis-round or emit scientific notation for small
+        step sizes; Decimal.__str__ is always exact."""
+        kwargs: dict[str, object] = dict(
+            symbol=symbol,
+            side=side,
+            type=order_type,
+            quantity=quantity,
+            new_client_order_id=client_order_id,
         )
+        if order_type == "LIMIT":
+            if price is None:
+                raise ValueError("LIMIT orders require a price")
+            kwargs["price"] = price
+            kwargs["time_in_force"] = "GTC"
 
-    def cancel_order(self, symbol: str, *, client_order_id: str | None = None, exchange_order_id: str | None = None) -> OrderInfo:
-        raise NotImplementedError(
-            "cancel_order is implemented in Fase 8 (execução real com idempotência, instrucao.md #45-#47)"
-        )
+        response = self._client.rest_api.new_order(**kwargs)
+        return self._to_order_info(response.data(), time_field="transact_time")
+
+    def cancel_order(
+        self, symbol: str, *, client_order_id: str | None = None, exchange_order_id: str | None = None
+    ) -> OrderInfo:
+        kwargs: dict[str, object] = {"symbol": symbol}
+        if client_order_id is not None:
+            kwargs["orig_client_order_id"] = client_order_id
+        if exchange_order_id is not None:
+            kwargs["order_id"] = int(exchange_order_id)
+        response = self._client.rest_api.delete_order(**kwargs)
+        return self._to_order_info(response.data(), time_field="transact_time")
 
     @staticmethod
-    def _to_order_info(o) -> OrderInfo:
+    def _to_order_info(o, *, time_field: str = "update_time") -> OrderInfo:
         return OrderInfo(
             exchange_order_id=str(o.order_id),
             client_order_id=o.client_order_id,
@@ -242,6 +273,6 @@ class BinanceExchangeAdapter(ExchangeAdapter):
             price=_d(o.price),
             orig_qty=_d(o.orig_qty),
             executed_qty=_d(o.executed_qty),
-            update_time=o.update_time,
+            update_time=getattr(o, time_field),
             raw=o.to_dict() if hasattr(o, "to_dict") else {},
         )

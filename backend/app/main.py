@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.routes import router as api_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 
@@ -29,6 +30,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="AdapterTrading API", version="0.1.0", lifespan=lifespan)
+app.include_router(api_router)
 
 
 @app.get("/health")

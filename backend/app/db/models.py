@@ -90,3 +90,177 @@ class OrderIntentRecord(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
+
+
+class ExchangeOrderRecord(Base):
+    """instrucao.md #82 — result of actually sending an OrderIntent to the exchange."""
+
+    __tablename__ = "exchange_orders"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    order_intent_id: Mapped[str] = mapped_column(String(36), ForeignKey("order_intents.id"), nullable=False)
+
+    exchange_order_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    client_order_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(10), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(10), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    price: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    orig_qty: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
+    executed_qty: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class FillRecord(Base):
+    """Individual exchange fill (instrucao.md #48, #82). A single order can produce many."""
+
+    __tablename__ = "fills"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    exchange_order_record_id: Mapped[str] = mapped_column(String(36), ForeignKey("exchange_orders.id"), nullable=False)
+    exchange_trade_id: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    exchange_order_id: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    price: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    quantity: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
+    commission: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    commission_asset: Mapped[str] = mapped_column(String(10), nullable=False)
+    is_buyer: Mapped[bool] = mapped_column(nullable=False)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class PositionRecord(Base):
+    """instrucao.md #50, #82. Derived from fills — never from OrderIntent alone."""
+
+    __tablename__ = "positions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(10), nullable=False, default="OPEN")  # OPEN | CLOSED
+
+    quantity: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
+    average_entry: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    cost_basis: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    fees_total: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False, default="0")
+
+    initial_stop_price: Mapped[str | None] = mapped_column(Numeric(24, 8), nullable=True)
+    stop_price: Mapped[str | None] = mapped_column(Numeric(24, 8), nullable=True)
+    take_profit: Mapped[str | None] = mapped_column(Numeric(24, 8), nullable=True)
+    trailing_stop: Mapped[str | None] = mapped_column(Numeric(24, 8), nullable=True)
+    break_even_active: Mapped[bool] = mapped_column(nullable=False, default=False)
+    highest_price_since_entry: Mapped[str | None] = mapped_column(Numeric(24, 8), nullable=True)
+
+    realized_pnl: Mapped[str | None] = mapped_column(Numeric(24, 8), nullable=True)
+
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class LedgerEntryRecord(Base):
+    """instrucao.md #54. Immutable — corrections are new ADJUSTMENT rows, never edits."""
+
+    __tablename__ = "ledger_entries"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)  # BUY|SELL|FEE|REALIZED_PNL|ADJUSTMENT
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    asset: Mapped[str] = mapped_column(String(10), nullable=False)
+    amount: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    position_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("positions.id"), nullable=True)
+    reference_id: Mapped[str | None] = mapped_column(String(36), nullable=True)  # e.g. fill id
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class TradeRecord(Base):
+    """instrucao.md #82 — closed round-trip trade, for MetricsEngine (win rate, expectancy, ...)."""
+
+    __tablename__ = "trades"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    position_id: Mapped[str] = mapped_column(String(36), ForeignKey("positions.id"), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    entry_price: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    exit_price: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    quantity: Mapped[str] = mapped_column(Numeric(32, 8), nullable=False)
+    fees_total: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    realized_pnl: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False)
+    exit_reason: Mapped[str] = mapped_column(String(30), nullable=False)
+
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ReconciliationLogRecord(Base):
+    """instrucao.md #56."""
+
+    __tablename__ = "reconciliation_log"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    type: Mapped[str] = mapped_column(String(30), nullable=False)  # startup | periodic
+    internal_state: Mapped[dict] = mapped_column(JSON, nullable=False)
+    exchange_state: Mapped[dict] = mapped_column(JSON, nullable=False)
+    difference: Mapped[dict] = mapped_column(JSON, nullable=False)
+    resolution: Mapped[str] = mapped_column(String(200), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # CONSISTENT | BLOCKED
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class BotStateRecord(Base):
+    """instrucao.md #59, #80, #81 — one singleton row per symbol. Never reset on restart."""
+
+    __tablename__ = "bot_state"
+
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="STARTING")
+
+    high_water_mark: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False, default="0")
+    daily_reference_equity: Mapped[str] = mapped_column(Numeric(24, 8), nullable=False, default="0")
+    daily_reference_date: Mapped[str] = mapped_column(String(10), nullable=False, default="")  # YYYY-MM-DD (UTC)
+
+    consecutive_losses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    manual_resume_required: Mapped[bool] = mapped_column(nullable=False, default=False)
+    block_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class RiskEventRecord(Base):
+    """instrucao.md #82 — audit trail for BLOCK_NEW_ENTRIES / PAUSED transitions (#37, #39)."""
+
+    __tablename__ = "risk_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    details: Mapped[dict] = mapped_column(JSON, nullable=False)
+    manual_resume_required: Mapped[bool] = mapped_column(nullable=False, default=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )

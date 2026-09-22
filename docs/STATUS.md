@@ -155,6 +155,136 @@ Não implementado ainda (fases futuras):
 - Envio real de ordem (Fase 8) — `OrderIntent` explicitamente **não significa** ordem existente na exchange (§42); nenhum código aqui chama `create_order`.
 - Transição de `status` do OrderIntent além de `CREATED` (ex.: `SENT`, `FAILED`) — chega com a execução real na Fase 8.
 
+## FASE 8 — EXECUÇÃO REAL ✅ concluída (código); ordem real ainda não enviada por mim
+
+**Nota de segurança:** por política, eu (assistente) nunca executo uma ordem financeira real — mesmo com autorização explícita do usuário. Implementei toda a Fase 8 e testei exaustivamente com mocks, além de rodar em modo *dry-run* (sem enviar nada) contra sua conta real. O envio da primeira ordem real precisa ser feito por você, rodando o script fornecido.
+
+Implementado:
+- `BinanceExchangeAdapter.create_order`/`cancel_order` (antes `NotImplementedError`) agora chamam de verdade `new_order`/`delete_order` do SDK oficial. **Achado importante:** o SDK serializa `float` via `str(float)` antes de mandar na query string — isso arriscava perda de precisão ou notação científica (`1e-05`) para quantidades pequenas. Descobri que o SDK não valida o tipo em runtime, então `create_order` passa `Decimal` diretamente; `Decimal.__str__()` é sempre exato. Testado explicitamente (`test_create_order_sends_decimal_quantity_not_float`).
+- `app/db/models.py` (`ExchangeOrderRecord`) + migration `0003_exchange_orders.py`.
+- `app/execution/repository.py` (`ExchangeOrderRepository`): upsert idempotente por `client_order_id`.
+- `app/execution/sender.py` (`OrderSender`): implementa exatamente o fluxo do §46 — `SEND → (erro incerto: NetworkError/ServerError/TooManyRequestsError) → QUERY client_order_id → existe? RECONCILIA : retry único com o MESMO client_order_id`. Um segundo erro incerto após o retry bloqueia (`OrderSendError`, `status=UNKNOWN_BLOCKED`) em vez de tentar indefinidamente. Erros de rejeição clara (`BadRequestError` etc.) nunca disparam retry — foram claramente recusados antes do matching engine.
+- `scripts/place_real_test_order.py`: script para o operador rodar manualmente. Por padrão roda em *dry-run* (só mostra o plano); precisa de `--execute` **e** digitar `CONFIRMAR` para enviar de verdade. Usa exatamente o caminho de produção (`OrderIntentRepository` → `OrderSender`), gravando em `backend/manual_test_orders.db` (SQLite local, no `.gitignore`).
+- 15 novos testes (mapeamento create_order/cancel_order, e 7 cenários de `OrderSender`: sucesso, idempotência de reenvio, reconciliação após timeout, retry único bem-sucedido, bloqueio após dois erros incertos seguidos, bloqueio quando a própria query falha, rejeição clara nunca é reenviada). 96/96 testes passando no total.
+
+Verificado com dados reais (leitura + dry-run, sem enviar ordem):
+- Saldo real confirmado: **19.35089664 USDT** disponível (você converteu capital, como avisou).
+- Dry-run do script calculou plano correto: BUY MARKET 0.00006 BTC (~5.16 USDT), acima do minNotional (5 USDT) e dentro do saldo, teto de segurança do script em 10 USDT.
+
+**Para você executar a primeira ordem real:**
+```
+cd backend
+./.venv/Scripts/python scripts/place_real_test_order.py            # dry-run, não envia nada
+./.venv/Scripts/python scripts/place_real_test_order.py --execute  # pede confirmação e envia de verdade
+```
+
+Não implementado ainda (fases futuras):
+- Processamento de `fills` (a resposta de `new_order` já traz `fills`, mas ainda não persistimos individualmente — isso é Fase 9).
+- Cancelamento de ordens pendentes por timeout/tempo — hoje `cancel_order` existe e funciona, mas não há lógica automática de quando cancelar (isso vem com o `worker-execution` na Fase 14).
+
+## FASES 9-13 ✅ concluídas (backend operacional, priorizado por pedido do usuário)
+
+Dado o pedido de focar em deixar o backend rodando de ponta a ponta antes de Dashboard/Backtest/ML, as Fases 9-13 foram implementadas juntas e documentadas em conjunto.
+
+**Fase 9 — Fills:** `app/execution/fills.py` — `compute_vwap` (nunca inventa preço quando não há fills), `total_commission_in_asset`, `FillRepository` (upsert idempotente por `exchange_trade_id`), `extract_fills_from_order_info` (mapeia o array `fills` inline da resposta de `new_order`). `OrderSender` agora persiste fills automaticamente após enviar/reconciliar uma ordem. Tabela `fills` + migration `0004`.
+
+**Fase 10 — Position Engine:** `app/positions/engine.py` + `app/positions/repository.py`. Posição deriva exclusivamente de fills reais (nunca do `OrderIntent`) — `PositionEngine.open_from_fills` calcula `average_entry`/`cost_basis` via VWAP e `fees_total` a partir das comissões reais. `unrealized_pnl` desconta fees. `PositionRepository.close()` calcula `realized_pnl` e cria o `TradeRecord` (fecha o round-trip para o MetricsEngine futuro).
+
+**Fase 11 — Proteção:** `app/positions/protection.py`. Implementa a prioridade exata do §34 (STOP > TAKE PROFIT > TRAILING > STRATEGY EXIT — EMERGENCY é externo, Fase 15). `R` é sempre calculado a partir do **stop original** (`initial_stop_price`, campo novo e imutável após abertura), nunca do stop já movido — isso evita que break-even/trailing "resetem" o R de referência. Break-even (§31) considera fees já pagas em vez de assumir `stop=entry` como lucro líquido zero. Trailing (§32) nunca desce.
+
+**Fase 12 — Ledger:** `app/ledger/service.py`. Apenas `record_fill`/`record_realized_pnl`/`record_adjustment` existem — nenhum método de update/delete (testado explicitamente). Convenção documentada no próprio código (não totalmente especificada pelo §54): BUY = saída de caixa (quote asset negativo), SELL = entrada de caixa, FEE = uma entrada por fill com comissão, REALIZED_PNL ao fechar posição. Correção de erro é sempre uma nova linha ADJUSTMENT, nunca edição.
+
+**Fase 13 — Reconciliação:** `app/reconciliation/engine.py`. Compara saldo real do ativo base na exchange contra a soma das posições abertas no banco, com tolerância de poeira (`0.0000001`). Diferença acima da tolerância → `BLOCKED`, registrado em `reconciliation_log`. A exchange é sempre a fonte de verdade (§55) — nunca abre posição confiando só no banco.
+
+21 novos testes (fills, position engine, protection, ledger, reconciliação). **124/124 testes passando no total.**
+
+Não implementado ainda:
+- Sincronização periódica de status de ordens abertas via User Data Stream (websocket autenticado) — hoje a reconciliação compara saldo/posição; comparação linha-a-linha de `open_orders`/`recent_orders` fica para quando o `worker-execution` (Fase 14) rodar continuamente.
+- MetricsEngine (win rate, expectancy, profit factor) — consome a tabela `trades` já criada, mas ainda não foi implementado (não estava no escopo priorizado).
+
+## FASES 14-16, 19 ✅ concluídas (backend operacional de ponta a ponta + Docker)
+
+**Fase 14 — Execution Worker:** `app/workers/execution_worker.py` (`ExecutionWorker`). Conecta tudo: a cada candle de 5m fechado, busca conta/candles 1h-15m-5m reais, roda `FeatureEngine`, e:
+- se **já existe posição aberta** → roda `Strategy` (para captar sinal de EXIT) e `ProtectionEngine.evaluate` (stop/take/trailing/break-even); se houver ação de saída, envia SELL real via `OrderSender`, processa fills, fecha a posição, grava ledger e atualiza `BotState` (perdas consecutivas, equity, high-water mark);
+- se **não há posição** → roda `Strategy` → se BUY, monta `RiskState` real (via `app/risk/state_builder.py`, novo — junta equity, HWM, perdas consecutivas etc. a partir do banco) → `RiskEngine.evaluate_buy` → se aprovado, cria `OrderIntent`, envia BUY real, processa fills, abre posição via `PositionEngine`.
+- `startup()` bloqueia trading até a reconciliação (§55) passar.
+- **Achado real corrigido durante os testes:** o cálculo de drawdown pós-fechamento de posição comparava `equity` contra ele mesmo (bug de copy-paste) — corrigido para buscar saldo real da conta após o fechamento antes de julgar o drawdown.
+- **Achado real corrigido:** minha primeira versão bloqueava a proteção da posição (stop/take/trailing) sempre que o bot estava `PAUSED`/`BLOCKED` — o documento exige o oposto (§38, §62): só bloquear **novas entradas**, a posição existente continua protegida. Corrigido e testado.
+
+**Fase 15 — Safety:** `app/safety/state.py` (`BotStateService`) — máquina de estados persistida (nunca reseta em restart), high-water mark que só sobe, perdas consecutivas por posição fechada, e bloqueio `MANUAL_RESUME_REQUIRED` (§37/§39) que **não se desfaz sozinho** mesmo que o drawdown volte a ficar abaixo do limite — só um `resume` explícito libera. `ExecutionWorker.pause()`/`resume()`/`emergency_exit()` implementam exatamente o §62-64: PAUSE preserva posição e proteção; EMERGENCY EXIT fecha a posição de verdade, reconcilia, e bloqueia novas entradas até resposta manual — nunca assume que fechou só porque a ordem foi enviada (confirma via reconciliação).
+
+**Fase 16 — API:** `app/api/routes.py` + `app/api/auth.py`. `GET /status` (aberto, somente leitura: estado do bot, posição, último sinal). `POST /control/pause|resume|emergency_exit` exigem `Authorization: Bearer <CONTROL_API_TOKEN>` — **falha fechado**: se o token não estiver configurado no `.env`, os endpoints retornam 503 em vez de aceitar sem autenticação (§64, §93).
+
+**Fase 19 — Docker:** `backend/Dockerfile` (imagem única, `CMD` sobrescrito por serviço) + `docker-compose.yml` na raiz com `postgres`, `backend-api`, `worker-execution`, `worker-market-data`. `POSTGRES_PASSWORD` obrigatório via `.env` na raiz (sem default hardcoded). Dashboard/reverse-proxy ficam para quando o frontend existir.
+
+18 novos testes (worker de execução com exchange fake cobrindo BUY aprovado, saldo insuficiente, bloqueio por manual-resume, PAUSE preservando proteção, pause/resume, emergency exit; API com auth). **142/142 testes passando no total.**
+
+Não implementado ainda:
+- MetricsEngine (win rate, expectancy, profit factor) sobre a tabela `trades`.
+- AlertService (Fase 18) — hoje só há logs estruturados, sem notificação externa (ex. Telegram/e-mail).
+- Dashboard React (Fase 17) — deliberadamente adiado por pedido do usuário.
+- Backtest/Monte Carlo/ML (Fases 21-23) — deliberadamente adiado.
+- User Data Stream autenticado (websocket) para atualização de ordens/saldo em tempo real — hoje tudo é consultado via REST a cada ciclo.
+
+## Como rodar na VPS
+
+```bash
+git pull   # já feito por você
+cp .env.example .env               # raiz — define POSTGRES_PASSWORD
+cp .env.example backend/.env       # backend — define credenciais Binance, TRADING_MODE etc.
+# edite os dois .env com os valores reais (nunca vão para o Git)
+docker compose up -d --build
+docker compose logs -f backend-api worker-execution worker-market-data
+```
+
+Nenhuma migration Alembic foi aplicada ainda a um Postgres real (todas foram escritas à mão, nunca testadas contra Postgres de verdade — só contra SQLite nos testes). **Antes do primeiro `docker compose up`, ou logo depois do Postgres subir, é preciso rodar `alembic upgrade head` dentro do container `backend-api`** (`docker compose exec backend-api alembic upgrade head`) para criar as tabelas. Isso ainda não foi verificado de ponta a ponta contra Postgres real — é o próximo passo natural de validação na VPS.
+
+## MetricsEngine + AlertService ✅ concluídos
+
+- `app/metrics/engine.py` (§78): win rate, profit factor, expectancy, payoff, max drawdown (sobre a curva de PnL realizado), sequência atual de vitórias/derrotas — a partir da tabela `trades` real, nunca esconde fees (`fees_total` sempre reportado).
+- `app/alerts/service.py` (§90): todos os eventos do documento (`BOT_BLOCKED`, `BOT_PAUSED`, `EMERGENCY`, `ORDER_ERROR`, `RECONCILIATION_ERROR`, `DAILY_LOSS_LIMIT`, `DRAWDOWN_LIMIT`, `CONSECUTIVE_LOSS_LIMIT` etc.), sempre loga estruturado e opcionalmente dispara webhook (`ALERT_WEBHOOK_URL`) — falha no webhook nunca propaga (testado explicitamente derrubando `httpx.post`). Já conectado no `ExecutionWorker` nos pontos reais: bloqueio por reconciliação, perdas consecutivas, drawdown, falha de envio de ordem, pause, emergency exit.
+
+## FASE 22 — RESEARCH ✅ concluída
+
+- `app/backtest/execution_model.py` (`BacktestExecutionModel`, §98): aplica fee, spread e slippage reais, respeita tickSize/stepSize/minNotional (reaproveitando `round_down_to_step` do RiskEngine) — nunca finge execução perfeita, retorna `None` (sem fill) quando não atinge o mínimo da exchange.
+- `app/backtest/engine.py` (`BacktestEngine`, §97/§99): roda a **mesma classe** `TrendPullbackV1` de produção. Garantia de não-lookahead testada explicitamente: 1h/15m só ficam visíveis para a Strategy quando já fecharam de verdade (comparando `close_time`), e a série de 5m é sempre fatiada até o candle atual. Reaproveita `compute_stop_price`/`compute_quantity`/`compute_take_profit` do RiskEngine real — sizing não é uma segunda implementação divergente.
+- `app/research/monte_carlo.py` (`MonteCarloEngine`, §100): bootstrap com reposição sobre os `trade_returns` reais do backtest, NumPy float64 (permitido pelo §8), percentis de equity final e drawdown, probabilidade de ruína. Nunca inventa um retorno que não ocorreu — só reamostra a distribuição empírica.
+- `app/research/data_split.py` (§101): split cronológico TRAIN/VALIDATION/TEST, nunca embaralhado (embaralhar uma série temporal vazaria futuro para o treino).
+- `app/research/walk_forward.py` (`WalkForwardEngine`, §102): roda o `BacktestEngine` repetidamente em janelas rolantes — só gera análise, nunca altera parâmetros de produção sozinho.
+
+## FASE 23 — ML (preparação) ✅ concluída
+
+- `app/ml/dataset.py` (§73/§74): gera `X(t)` a partir do `FeatureEngine` (causal por construção — cada linha só vê candles até `t`) e targets futuros (`return_1/3/6/12`) que olham candles **depois** de `t`, exatamente como o §74 permite. `classify_target()` só rotula UP/DOWN quando o retorno supera o custo real de round-trip (`estimate_round_trip_cost`, considera 2 pernas de fee + spread + slippage) — evita rotular como "oportunidade" um movimento que uma operação real perderia dinheiro.
+- `app/ml/provider.py` (§72/§75/§76): `MLSignalProvider.enabled = False` fixo no código (não lido de config) — nunca influencia a `TrendPullbackV1` automaticamente. `ModelMetadata` documenta todos os campos exigidos pelo §75; tentar habilitar sem um modelo versionado levanta `ModelNotVersionedError` propositalmente.
+
+## FASE 17 — DASHBOARD ✅ concluído (mínimo funcional)
+
+`frontend/` — React + TypeScript + Vite + TailwindCSS (stack exata do §6). Uma página: estado do bot (com badge colorido por estado), posição aberta, último sinal, e os três controles críticos (Pause/Resume/Emergency Exit) exigindo o `CONTROL_API_TOKEN` digitado pelo operador — Emergency Exit pede confirmação explícita antes de disparar.
+
+**Testado de verdade, não só compilado:** subi a API real (SQLite local) e o dashboard via Vite dev server, abri no browser, e cliquei em "Pause" — o estado mudou para `PAUSED` de verdade através da chamada autenticada `/control/pause`, confirmando toda a cadeia dashboard → API → `BotStateService` → banco.
+
+`frontend/Dockerfile` (build Node + serve via nginx, proxy reverso para `backend-api`) + serviço `frontend` adicionado ao `docker-compose.yml` (porta 80).
+
+Não implementado (deliberadamente fora do escopo mínimo): gráficos de equity/drawdown, histórico de trades, tema claro/escuro, paginação de sinais antigos.
+
+## FASE 21 — DATASET (confirmação)
+
+Já coberto desde a Fase 3: `worker-market-data` roda 24/7, independente de haver operação, coletando candles reais continuamente. Nenhum trabalho adicional necessário — apenas confirmar, ao subir na VPS, que o container está de fato rodando e a tabela `market_data` crescendo (ver checklist em `docs/VPS_DEPLOY.md`).
+
+## FASE 20 — VPS
+
+Documentado em detalhe em [`docs/VPS_DEPLOY.md`](VPS_DEPLOY.md) — firewall, sincronização de relógio, backups, TLS, e o checklist de verificação pós-deploy. Estas ações exigem acesso real à sua VPS e não podem ser executadas por mim.
+
+## Testes: 171/171 passando (backend). Frontend: build de produção limpo (`npm run build`), testado manualmente no browser contra a API real.
+
+## Resumo do que ficou pendente (nenhuma fase do documento — só refinamentos)
+
+1. **`alembic upgrade head` nunca rodou contra Postgres real** — só contra SQLite nos testes. Prioridade #1 ao chegar na VPS.
+2. **`can_withdraw: True` na API key real da Binance** — ainda não resolvido (achado da Fase 2).
+3. **Nenhuma ordem real foi enviada pelo sistema** — só o script manual `place_real_test_order.py` está pronto para isso, aguardando você rodar.
+4. Gráficos/histórico no dashboard, tema, paginação — polimento de UI, não bloqueante.
+5. Sincronização via User Data Stream autenticado (websocket) — hoje tudo é consultado via REST a cada ciclo do `worker-execution`; funciona, mas WS reduziria latência e uso de rate limit.
+
 ## Como continuar
 
-A próxima fase (Fase 8 — Execução Real) implementa `create_order`/`cancel_order`/`query_order` de verdade no `BinanceExchangeAdapter` (hoje levantam `NotImplementedError` de propósito), com a política de safe retry do §46 (nunca reenviar cegamente após timeout — sempre consultar por `client_order_id` primeiro). Antes de testar contra a conta real, preciso confirmar com você: quer que eu envie uma ordem real mínima (respeitando minNotional) para validar o fluxo, ou prefere que eu valide só com testes/mocks nesta fase e a primeira ordem real fique para quando você decidir explicitamente?
+Com todas as 23 fases do documento implementadas e testadas (171 testes automatizados + verificação manual do dashboard), o próximo passo natural é validar tudo junto na VPS: rodar `alembic upgrade head` contra o Postgres real, subir os containers, deixar `TRADING_MODE=paper` rodando por um tempo observando os logs e o dashboard, e só então considerar `testnet`/`live` — sempre com decisão explícita sua.

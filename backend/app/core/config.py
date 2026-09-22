@@ -85,6 +85,9 @@ class Settings(BaseSettings):
     # --- Auth for critical endpoints (instrucao.md #93, #64) ---
     control_api_token: str | None = Field(default=None, repr=False)
 
+    # --- AlertService (instrucao.md #90) — optional webhook, alerts still log without it ---
+    alert_webhook_url: str | None = None
+
     @property
     def is_live(self) -> bool:
         return self.trading_mode is TradingMode.LIVE

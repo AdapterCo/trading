@@ -108,11 +108,50 @@ def test_get_trades_maps_commission_and_side(adapter):
     assert fills[0].is_buyer is True
 
 
-def test_create_order_not_implemented_in_fase_2(adapter):
-    with pytest.raises(NotImplementedError):
-        adapter.create_order(symbol="BTCUSDT", side="BUY", order_type="MARKET", quantity=Decimal("1"), client_order_id="x")
+def test_create_order_sends_decimal_quantity_not_float(adapter):
+    captured = {}
+
+    def fake_new_order(**kwargs):
+        captured.update(kwargs)
+        order = SimpleNamespace(
+            order_id=1, client_order_id=kwargs["new_client_order_id"], symbol="BTCUSDT",
+            side="BUY", type="MARKET", status="FILLED", price="0.00000000",
+            orig_qty="0.00001000", executed_qty="0.00001000", transact_time=1_700_000_000_000,
+        )
+        return _wrap(order)
+
+    adapter._client.rest_api.new_order = fake_new_order
+
+    info = adapter.create_order(
+        symbol="BTCUSDT", side="BUY", order_type="MARKET",
+        quantity=Decimal("0.00001000"), client_order_id="AT123",
+    )
+    # The exact Decimal object must reach the SDK call — never a lossy float conversion.
+    assert captured["quantity"] == Decimal("0.00001000")
+    assert isinstance(captured["quantity"], Decimal)
+    assert info.status == "FILLED"
+    assert info.update_time == 1_700_000_000_000
 
 
-def test_cancel_order_not_implemented_in_fase_2(adapter):
-    with pytest.raises(NotImplementedError):
-        adapter.cancel_order("BTCUSDT", client_order_id="x")
+def test_create_order_limit_requires_price(adapter):
+    with pytest.raises(ValueError):
+        adapter.create_order(
+            symbol="BTCUSDT", side="BUY", order_type="LIMIT",
+            quantity=Decimal("1"), client_order_id="AT123",
+        )
+
+
+def test_cancel_order_maps_transact_time(adapter):
+    def fake_delete_order(**kwargs):
+        order = SimpleNamespace(
+            order_id=1, client_order_id=kwargs.get("orig_client_order_id"), symbol="BTCUSDT",
+            side="BUY", type="MARKET", status="CANCELED", price="0.00000000",
+            orig_qty="0.00001000", executed_qty="0.00000000", transact_time=1_700_000_001_000,
+        )
+        return _wrap(order)
+
+    adapter._client.rest_api.delete_order = fake_delete_order
+
+    info = adapter.cancel_order("BTCUSDT", client_order_id="AT123")
+    assert info.status == "CANCELED"
+    assert info.update_time == 1_700_000_001_000
