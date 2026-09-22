@@ -105,6 +105,7 @@ class ExecutionWorker:
         c1h = self._exchange.get_klines(s.symbol, s.macro_interval, limit=250)
         c15m = self._exchange.get_klines(s.symbol, s.trend_interval, limit=250)
         c5m = self._exchange.get_klines(s.symbol, s.entry_interval, limit=250)
+        c5m = _ensure_current_candle_included(c5m, candle_5m)
 
         f1h = self._feature_engine.compute_latest(c1h)
         f15m = self._feature_engine.compute_latest(c15m)
@@ -357,6 +358,19 @@ def _vwap(fills):
     from app.execution.fills import compute_vwap
 
     return compute_vwap(fills)
+
+
+def _ensure_current_candle_included(candles: list, current):
+    """The exchange's REST /klines history can lag a few hundred ms behind a
+    just-closed candle the WebSocket already confirmed — without this, Strategy
+    sees a stale series missing the very candle that triggered this cycle and
+    HOLDs with MISSING_5M_FEATURE_FOR_CANDLE on every single close. `current`
+    (from the WS event) is always authoritative for its own open_time."""
+    if not candles or candles[-1].open_time < current.open_time:
+        return [*candles, current]
+    if candles[-1].open_time == current.open_time:
+        return [*candles[:-1], current]
+    return candles
 
 
 async def main() -> None:

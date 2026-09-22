@@ -257,3 +257,62 @@ def test_paper_mode_fills_use_real_market_price_and_commission():
     position = session.query(PositionRecord).one()
     assert Decimal(position.average_entry) == Decimal("123.45")  # real best-ask price, not the candle close
     assert Decimal(position.fees_total) > 0  # real taker commission applied
+
+
+def test_ensure_current_candle_included_appends_when_rest_history_lags():
+    """Reproduces the real MISSING_5M_FEATURE_FOR_CANDLE incident from the VPS:
+    REST /klines hadn't indexed the just-closed candle the WebSocket already confirmed."""
+    from app.workers.execution_worker import _ensure_current_candle_included
+
+    stale_history = [_candle(0, "100"), _candle(300_000, "101")]  # missing the newest close
+    current = _candle(600_000, "102")
+
+    result = _ensure_current_candle_included(stale_history, current)
+
+    assert result[-1] is current
+    assert [c.open_time for c in result] == [0, 300_000, 600_000]
+
+
+def test_ensure_current_candle_included_replaces_stale_duplicate():
+    from app.workers.execution_worker import _ensure_current_candle_included
+
+    stale_current = _candle(600_000, "999")  # REST returned a not-yet-final value for this candle
+    history = [_candle(0, "100"), _candle(300_000, "101"), stale_current]
+    fresh_current = _candle(600_000, "102")
+
+    result = _ensure_current_candle_included(history, fresh_current)
+
+    assert len(result) == 3
+    assert result[-1] is fresh_current
+
+
+def test_ensure_current_candle_included_noop_when_already_present_and_matching():
+    from app.workers.execution_worker import _ensure_current_candle_included
+
+    current = _candle(600_000, "102")
+    history = [_candle(0, "100"), _candle(300_000, "101"), current]
+
+    result = _ensure_current_candle_included(history, current)
+
+    assert result == history
+
+
+def test_run_cycle_finds_signal_even_when_rest_history_lags_behind_websocket(monkeypatch):
+    """End-to-end regression test for the real production incident: REST history
+    missing the just-closed candle must no longer produce MISSING_5M_FEATURE_FOR_CANDLE."""
+    session = _session()
+    monkeypatch.setattr("app.workers.execution_worker.SessionLocal", lambda: session)
+
+    class LaggingFakeExchange(FakeExchange):
+        def get_klines(self, symbol, interval, *, start_time=None, end_time=None, limit=1000):
+            # deliberately omit the candle that is about to close (index 29)
+            return [_candle(i * 300_000, "100") for i in range(29)]
+
+    exchange = LaggingFakeExchange(usdt_balance=Decimal("1000"), ask_price=Decimal("100"))
+    worker = _worker(exchange)
+
+    candle = _candle(29 * 300_000, "100")
+    worker._run_cycle(session, candle)
+
+    signal = session.query(models.SignalRecord).order_by(models.SignalRecord.created_at.desc()).first()
+    assert "MISSING_5M_FEATURE_FOR_CANDLE" not in (signal.reasons or [])
