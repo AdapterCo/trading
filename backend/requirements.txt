@@ -8,7 +8,9 @@ psycopg[binary]>=3.1,<4.0
 python-dotenv>=1.0,<2.0
 httpx>=0.27,<1.0
 binance-sdk-spot>=11.3.0,<12.0
-binance-common>=1.0,<2.0
+# binance-common version is dictated by whatever binance-sdk-spot itself requires
+# (it changed from <2.0 to ==4.4.0 between local dev and this deploy) — let pip
+# resolve it as a transitive dependency instead of pinning a range that can drift.
 numpy>=1.26,<3.0
 
 pytest>=8.0,<9.0
